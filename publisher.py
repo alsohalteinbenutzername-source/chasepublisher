@@ -12,6 +12,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import websockets
 from wetterdienst.provider.dwd.radar import (
@@ -44,6 +45,21 @@ RAIN_TRACK_MAX_POINTS = 12
 LIVE_DATA_RETENTION = timedelta(hours=2)
 STORAGE_LIST_PAGE_SIZE = 1000
 STORAGE_DELETE_BATCH_SIZE = 1000
+OUTLOOK_TIMEZONE = ZoneInfo("Europe/Berlin")
+OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
+OUTLOOK_GRID_SPACING = 0.4
+OUTLOOK_API_URL = "https://api.open-meteo.com/v1/dwd-icon"
+OUTLOOK_HOURLY_FIELDS = (
+    "cape,convective_inhibition,temperature_850hPa,temperature_700hPa,"
+    "temperature_500hPa,temperature_2m,dew_point_2m,relative_humidity_2m,"
+    "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
+    "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
+    "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
+    "wind_speed_500hPa,wind_direction_500hPa"
+).split(",")
+OUTLOOK_BATCH_SIZE = 100
+OUTLOOK_CALLS_PER_MINUTE = 450
+OUTLOOK_RETRY_ATTEMPTS = 4
 
 
 class PublisherError(RuntimeError):
@@ -156,6 +172,208 @@ def _upsert(table: str, conflict: str, rows: list[dict[str, Any]]) -> None:
         payload=rows,
         extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
     )
+
+
+
+def _outlook_axis_points(start: float, end: float) -> list[float]:
+    values = [
+        start + index * OUTLOOK_GRID_SPACING
+        for index in range(int((end - start) / OUTLOOK_GRID_SPACING) + 1)
+    ]
+    if values[-1] < end:
+        values.append(end)
+    return values
+
+
+def _outlook_grid_points() -> list[tuple[float, float]]:
+    west, east, south, north = OUTLOOK_EXTENT
+    latitudes = _outlook_axis_points(south, north)
+    longitudes = _outlook_axis_points(west, east)
+    points = [(latitude, longitude) for latitude in latitudes for longitude in longitudes]
+    if len(points) != 744:
+        raise PublisherError(f"Outlook grid must contain 744 points, got {len(points)}.")
+    return points
+
+
+def _valid_outlook_grid(grid: Any) -> bool:
+    if not isinstance(grid, list) or len(grid) != 744:
+        return False
+    for point in grid:
+        if not isinstance(point, dict):
+            return False
+        hourly = point.get("icon_d2")
+        if not isinstance(hourly, dict):
+            return False
+        times = hourly.get("time")
+        if not isinstance(times, list) or not times:
+            return False
+        if not isinstance(hourly.get("cin"), list) or len(hourly["cin"]) != len(times):
+            return False
+        for field in OUTLOOK_HOURLY_FIELDS:
+            values = hourly.get(field)
+            if not isinstance(values, list) or len(values) != len(times):
+                return False
+    return True
+
+
+def _fetch_openmeteo_batch(request_params: dict[str, Any]) -> list[dict[str, Any]]:
+    url = f"{OUTLOOK_API_URL}?{urlencode(request_params)}"
+    for attempt in range(OUTLOOK_RETRY_ATTEMPTS):
+        try:
+            request = Request(url, headers={"Accept": "application/json"})
+            with urlopen(request, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            retryable = error.code in {408, 425, 429} or error.code >= 500
+            if not retryable or attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
+                raise PublisherError(
+                    f"Open-Meteo returned HTTP {error.code}: {detail[:500]}"
+                ) from error
+            retry_after = error.headers.get("Retry-After")
+            try:
+                delay = min(max(float(retry_after), 1.0), 60.0) if retry_after else 5.0 * (2**attempt)
+            except ValueError:
+                delay = 5.0 * (2**attempt)
+            time.sleep(min(delay, 60.0))
+        except (URLError, TimeoutError, OSError) as error:
+            if attempt + 1 >= OUTLOOK_RETRY_ATTEMPTS:
+                raise PublisherError(f"Could not reach Open-Meteo: {error}") from error
+            time.sleep(min(5.0 * (2**attempt), 60.0))
+        except json.JSONDecodeError as error:
+            raise PublisherError("Open-Meteo returned malformed JSON.") from error
+        else:
+            if isinstance(payload, dict):
+                payload = [payload]
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                raise PublisherError("Open-Meteo returned an invalid outlook batch.")
+            if any(item.get("error") for item in payload):
+                reason = next(
+                    (item.get("reason", "API error") for item in payload if item.get("error")),
+                    "API error",
+                )
+                raise PublisherError(f"Open-Meteo outlook request failed: {reason}")
+            return payload
+    raise PublisherError("Open-Meteo outlook request failed after retries.")
+
+
+def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
+    points = _outlook_grid_points()
+    batches = [
+        points[index : index + OUTLOOK_BATCH_SIZE]
+        for index in range(0, len(points), OUTLOOK_BATCH_SIZE)
+    ]
+    calls_per_location = len(OUTLOOK_HOURLY_FIELDS) / 10.0
+    max_batches_per_minute = max(
+        1,
+        int(
+            OUTLOOK_CALLS_PER_MINUTE
+            // (OUTLOOK_BATCH_SIZE * calls_per_location)
+        ),
+    )
+    batch_interval = 60.0 / max_batches_per_minute + 2.0
+    started_at = time.monotonic()
+    grid: list[dict[str, Any]] = []
+
+    for batch_index, batch in enumerate(batches):
+        scheduled_at = started_at + batch_index * batch_interval
+        wait_seconds = scheduled_at - time.monotonic()
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        request_params = {
+            "latitude": ",".join(f"{latitude:.3f}" for latitude, _ in batch),
+            "longitude": ",".join(f"{longitude:.3f}" for _, longitude in batch),
+            "hourly": ",".join(OUTLOOK_HOURLY_FIELDS),
+            "models": "icon_d2",
+            "forecast_days": 2,
+            "timezone": "Europe/Berlin",
+            "wind_speed_unit": "kmh",
+        }
+        payload = _fetch_openmeteo_batch(request_params)
+        if len(payload) != len(batch):
+            raise PublisherError(
+                f"Open-Meteo returned {len(payload)} forecasts for a "
+                f"{len(batch)}-point outlook batch."
+            )
+
+        for point in payload:
+            hourly = point.get("hourly")
+            if not isinstance(hourly, dict):
+                raise PublisherError("Open-Meteo outlook point has no hourly data.")
+            times = hourly.get("time")
+            if not isinstance(times, list) or not times:
+                raise PublisherError("Open-Meteo outlook point has no timestamps.")
+            missing = [
+                field
+                for field in OUTLOOK_HOURLY_FIELDS
+                if not isinstance(hourly.get(field), list)
+                or len(hourly[field]) != len(times)
+            ]
+            if missing:
+                raise PublisherError(
+                    "Open-Meteo outlook point is missing hourly fields: "
+                    + ", ".join(missing)
+                )
+
+            cape_values = hourly["cape"]
+            cin_values = hourly["convective_inhibition"]
+            temperature_values = hourly["temperature_2m"]
+            dewpoint_values = hourly["dew_point_2m"]
+            temperature_850_values = hourly["temperature_850hPa"]
+            hourly["cin"] = []
+            for index in range(len(times)):
+                cape = cape_values[index]
+                cape_values[index] = max(float(cape or 0), 0)
+                cin = cin_values[index]
+                if cin is None:
+                    temp = temperature_values[index]
+                    dewpoint = dewpoint_values[index]
+                    temp850 = temperature_850_values[index]
+                    if temp is not None and dewpoint is not None and temp850 is not None:
+                        cin = -(float(temp) - float(dewpoint)) * 5 + (float(temp) - float(temp850)) * 3
+                hourly["cin"].append(-abs(float(cin)) if cin is not None else 0.0)
+            grid.append({"icon_d2": hourly})
+
+    if not _valid_outlook_grid(grid):
+        raise PublisherError("Open-Meteo returned an incomplete daily outlook grid.")
+    return grid
+
+
+def publish_daily_outlook() -> None:
+    forecast_date = datetime.now(OUTLOOK_TIMEZONE).date()
+    date_text = forecast_date.isoformat()
+    rows = _request(
+        "GET",
+        "/rest/v1/daily_outlook_forecasts",
+        query={
+            "select": "forecast_date,grid_payload",
+            "forecast_date": f"eq.{date_text}",
+            "limit": "1",
+        },
+    )
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise PublisherError("Supabase returned an invalid daily outlook response.")
+    if rows and rows[0].get("forecast_date") == date_text:
+        if _valid_outlook_grid(rows[0].get("grid_payload")):
+            LOG.info("Daily outlook for %s is already published; skipping Open-Meteo.", date_text)
+            return
+        LOG.warning("Stored daily outlook for %s is incomplete; refreshing it.", date_text)
+
+    LOG.info("Fetching the once-daily ICON-D2 outlook grid for %s.", date_text)
+    grid = _fetch_daily_outlook_grid()
+    _upsert(
+        "daily_outlook_forecasts",
+        "forecast_date",
+        [
+            {
+                "forecast_date": date_text,
+                "issued_at": _iso(datetime.now(timezone.utc)),
+                "grid_payload": grid,
+            }
+        ],
+    )
+    LOG.info("Published the daily outlook grid for %s (%d points).", date_text, len(grid))
 
 
 def _publish_snapshot(product: str, scope: str, observed_at: datetime, payload: dict[str, Any]) -> None:
@@ -598,6 +816,7 @@ def main() -> None:
         ("KONRAD3D", publish_konrad3d),
         ("velocity/rotation", publish_velocity_and_rotations),
         ("lightning", publish_lightning),
+        ("daily outlook", publish_daily_outlook),
     )
     for name, task in tasks:
         try:
