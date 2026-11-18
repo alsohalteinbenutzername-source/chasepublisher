@@ -43,8 +43,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$(TZ=Europe/Berlin date +%H)" != "00" ]; then
-            echo "Skipping because it is not midnight in Europe/Berlin."
-            exit 0
-          fi
           python publisher.py --daily-outlook-only
