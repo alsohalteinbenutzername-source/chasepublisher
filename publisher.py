@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
@@ -802,22 +803,41 @@ def publish_lightning() -> None:
     LOG.info("Published %d lightning strikes.", len(rows))
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     global SUPABASE_URL, SERVICE_KEY
+    parser = argparse.ArgumentParser(description="Publish StormChase data.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--skip-daily-outlook",
+        action="store_true",
+        help="Publish live data without refreshing the daily outlook.",
+    )
+    modes.add_argument(
+        "--daily-outlook-only",
+        action="store_true",
+        help="Publish only the daily outlook grid.",
+    )
+    args = parser.parse_args(argv)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     SUPABASE_URL, SERVICE_KEY = _configuration()
     failures: list[str] = []
-    tasks = (
-        ("radar Storage retention", purge_expired_radar_objects),
-        ("reflectivity/rain cells", publish_reflectivity_and_rain),
-        ("KONRAD3D", publish_konrad3d),
-        ("velocity/rotation", publish_velocity_and_rotations),
-        ("lightning", publish_lightning),
-        ("daily outlook", publish_daily_outlook),
-    )
+    if args.daily_outlook_only:
+        tasks = (("daily outlook", publish_daily_outlook),)
+    else:
+        tasks = (
+            ("radar Storage retention", purge_expired_radar_objects),
+            ("reflectivity/rain cells", publish_reflectivity_and_rain),
+            ("KONRAD3D", publish_konrad3d),
+            ("velocity/rotation", publish_velocity_and_rotations),
+            ("lightning", publish_lightning),
+        )
+        if not args.skip_daily_outlook:
+            tasks += (("daily outlook", publish_daily_outlook),)
+
     for name, task in tasks:
         try:
             task()
