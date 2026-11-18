@@ -15,10 +15,7 @@ jobs:
   publish:
     if: github.event_name != 'schedule' || (github.event.schedule != '0 23 * * *' && github.event.schedule != '0 22 * * *')
     runs-on: ubuntu-latest
-    timeout-minutes: 12
-    concurrency:
-      group: stormchase-supabase-publisher
-      cancel-in-progress: false
+    timeout-minutes: 10
     steps:
       - name: Check out publisher
         uses: actions/checkout@v4
@@ -52,9 +49,6 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && (github.event.schedule == '0 23 * * *' || github.event.schedule == '0 22 * * *'))
     runs-on: ubuntu-latest
     timeout-minutes: 12
-    concurrency:
-      group: stormchase-daily-outlook
-      cancel-in-progress: false
     steps:
       - name: Check out publisher
         uses: actions/checkout@v4
