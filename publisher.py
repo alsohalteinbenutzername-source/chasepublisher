@@ -15,6 +15,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import websockets
 from wetterdienst.provider.dwd.radar import (
     DwdRadarDate,
@@ -51,13 +52,30 @@ OUTLOOK_EXTENT = (4.0, 16.0, 47.0, 56.0)
 OUTLOOK_GRID_SPACING = 0.4
 OUTLOOK_API_URL = "https://api.open-meteo.com/v1/dwd-icon"
 OUTLOOK_HOURLY_FIELDS = (
-    "cape,convective_inhibition,temperature_850hPa,temperature_700hPa,"
-    "temperature_500hPa,temperature_2m,dew_point_2m,relative_humidity_2m,"
+    "cape,convective_inhibition,surface_pressure,"
+    "temperature_2m,dew_point_2m,relative_humidity_2m,"
+    "temperature_925hPa,temperature_850hPa,temperature_700hPa,"
+    "temperature_500hPa,relative_humidity_925hPa,relative_humidity_850hPa,"
+    "relative_humidity_700hPa,relative_humidity_500hPa,"
+    "geopotential_height_925hPa,geopotential_height_850hPa,"
+    "geopotential_height_700hPa,geopotential_height_500hPa,"
     "precipitation,snowfall,wind_speed_10m,wind_direction_10m,"
+    "wind_speed_180m,wind_direction_180m,"
     "wind_speed_925hPa,wind_direction_925hPa,wind_speed_850hPa,"
     "wind_direction_850hPa,wind_speed_700hPa,wind_direction_700hPa,"
     "wind_speed_500hPa,wind_direction_500hPa"
 ).split(",")
+OUTLOOK_PROFILE_FIELDS = (
+    "srh_0_1km",
+    "srh_0_3km",
+    "srh_efficiency",
+    "shear_0_500m",
+    "critical_angle",
+    "low_level_lapse",
+    "cape_0_3km",
+    "lfc",
+)
+NO_LFC_SENTINEL_M = 6000.0
 OUTLOOK_BATCH_SIZE = 100
 OUTLOOK_CALLS_PER_MINUTE = 450
 OUTLOOK_RETRY_ATTEMPTS = 4
@@ -175,6 +193,464 @@ def _upsert(table: str, conflict: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _hourly_number(hourly: dict[str, Any], index: int, field: str) -> float | None:
+    values = hourly.get(field)
+    if not isinstance(values, list) or index >= len(values):
+        return None
+    return _finite_float(values[index])
+
+
+def _wind_profile_metrics(
+    hourly: dict[str, Any],
+    index: int,
+) -> dict[str, float] | None:
+    elevation = _finite_float(hourly.get("surface_elevation_m"))
+    if elevation is None:
+        return None
+
+    profile_inputs = [
+        (10.0, "wind_speed_10m", "wind_direction_10m"),
+        (180.0, "wind_speed_180m", "wind_direction_180m"),
+    ]
+    profile = []
+    for height, speed_field, direction_field in profile_inputs:
+        speed = _hourly_number(hourly, index, speed_field)
+        direction = _hourly_number(hourly, index, direction_field)
+        if speed is None or direction is None or speed < 0:
+            return None
+        profile.append((height, speed / 3.6, direction))
+
+    for level in (925, 850, 700, 500):
+        geopotential_height = _hourly_number(
+            hourly,
+            index,
+            f"geopotential_height_{level}hPa",
+        )
+        if geopotential_height is None:
+            return None
+        height = geopotential_height - elevation
+        if height < 10.0:
+            continue
+        speed = _hourly_number(hourly, index, f"wind_speed_{level}hPa")
+        direction = _hourly_number(hourly, index, f"wind_direction_{level}hPa")
+        if speed is None or direction is None or speed < 0:
+            return None
+        profile.append((height, speed / 3.6, direction))
+
+    profile.sort(key=lambda point: point[0])
+    if (
+        len(profile) < 3
+        or profile[0][0] != 10.0
+        or not any(point[0] == 180.0 for point in profile)
+        or profile[-1][0] < 3000.0
+    ):
+        return None
+
+    heights = np.asarray([point[0] for point in profile], dtype=float)
+    directions = np.deg2rad(np.asarray([point[2] for point in profile], dtype=float))
+    speeds = np.asarray([point[1] for point in profile], dtype=float)
+    components = np.column_stack(
+        (-speeds * np.sin(directions), -speeds * np.cos(directions))
+    )
+    u_wind, v_wind = components[:, 0], components[:, 1]
+
+    def wind_at(height: float) -> tuple[float, float]:
+        return (
+            float(np.interp(height, heights, u_wind)),
+            float(np.interp(height, heights, v_wind)),
+        )
+
+    def mean_wind(bottom: float, top: float) -> tuple[float, float]:
+        interior = heights[(heights > bottom) & (heights < top)]
+        levels = np.concatenate(([bottom], interior, [top]))
+        u_values = np.interp(levels, heights, u_wind)
+        v_values = np.interp(levels, heights, v_wind)
+        layer_depths = np.diff(levels)
+        return (
+            float(np.sum((u_values[:-1] + u_values[1:]) * layer_depths / 2) / (top - bottom)),
+            float(np.sum((v_values[:-1] + v_values[1:]) * layer_depths / 2) / (top - bottom)),
+        )
+
+    def shear_between(bottom: float, top: float) -> float:
+        u0, v0 = wind_at(bottom)
+        u1, v1 = wind_at(top)
+        return math.hypot(u1 - u0, v1 - v0)
+
+    top = min(6000.0, float(heights[-1]))
+    mean_u, mean_v = mean_wind(0.0, top)
+    low_u, low_v = mean_wind(0.0, top / 2.0)
+    high_u, high_v = mean_wind(top / 2.0, top)
+    shear_u, shear_v = high_u - low_u, high_v - low_v
+    shear_magnitude = math.hypot(shear_u, shear_v)
+    storm_motion = None
+    if shear_magnitude >= 1e-6:
+        storm_motion = (
+            mean_u + 7.5 * shear_v / shear_magnitude,
+            mean_v - 7.5 * shear_u / shear_magnitude,
+        )
+
+    def storm_relative_helicity(layer_top: float) -> float | None:
+        if storm_motion is None or heights[-1] < layer_top:
+            return None
+        interior = heights[(heights > 0) & (heights < layer_top)]
+        levels = np.concatenate(([0.0], interior, [layer_top]))
+        u_values = np.interp(levels, heights, u_wind) - storm_motion[0]
+        v_values = np.interp(levels, heights, v_wind) - storm_motion[1]
+        du = np.diff(u_values)
+        dv = np.diff(v_values)
+        return max(float(np.sum(u_values[:-1] * dv - v_values[:-1] * du)), 0.0)
+
+    srh_1km = storm_relative_helicity(1000.0)
+    srh_3km = storm_relative_helicity(3000.0)
+    surface_u, surface_v = wind_at(10.0)
+    wind180_u, wind180_v = wind_at(180.0)
+    low_shear_u, low_shear_v = wind180_u - surface_u, wind180_v - surface_v
+    inflow_angle = 0.0
+    if storm_motion is not None:
+        inflow_u = storm_motion[0] - surface_u
+        inflow_v = storm_motion[1] - surface_v
+        denominator = math.hypot(inflow_u, inflow_v) * math.hypot(
+            low_shear_u,
+            low_shear_v,
+        )
+        if denominator > 1e-6:
+            cosine = np.clip(
+                (inflow_u * low_shear_u + inflow_v * low_shear_v) / denominator,
+                -1.0,
+                1.0,
+            )
+            inflow_angle = math.degrees(math.acos(float(cosine)))
+
+    efficiency = 0.0
+    if srh_1km is not None and storm_motion is not None:
+        mean_u, mean_v = mean_wind(0.0, 1000.0)
+        mean_storm_relative_wind = math.hypot(
+            mean_u - storm_motion[0],
+            mean_v - storm_motion[1],
+        )
+        theoretical_srh = mean_storm_relative_wind * shear_between(0.0, 1000.0)
+        if theoretical_srh > 1e-6:
+            efficiency = min(srh_1km / theoretical_srh, 1.0)
+
+    return {
+        "srh_0_1km": srh_1km if srh_1km is not None else 0.0,
+        "srh_0_3km": srh_3km if srh_3km is not None else 0.0,
+        "srh_efficiency": efficiency,
+        "shear_0_500m": shear_between(0.0, 500.0),
+        "critical_angle": inflow_angle,
+    }
+
+
+def _low_level_lapse_rate(hourly: dict[str, Any], index: int) -> float | None:
+    surface = _hourly_number(hourly, index, "temperature_2m")
+    if surface is None:
+        return None
+
+    elevation = _finite_float(hourly.get("surface_elevation_m"))
+    if elevation is None:
+        return None
+    profile = [(2.0, surface)]
+    for level in (925, 850, 700, 500):
+        temperature = _hourly_number(hourly, index, f"temperature_{level}hPa")
+        geopotential_height = _hourly_number(
+            hourly,
+            index,
+            f"geopotential_height_{level}hPa",
+        )
+        if temperature is None or geopotential_height is None:
+            return None
+        height = geopotential_height - elevation
+        if height > profile[-1][0]:
+            profile.append((height, temperature))
+    if profile[-1][0] < 2000.0:
+        return None
+    heights = np.asarray([point[0] for point in profile], dtype=float)
+    temperatures = np.asarray([point[1] for point in profile], dtype=float)
+    temperature_2km = float(np.interp(2000.0, heights, temperatures))
+    return (surface - temperature_2km) / 2.0
+
+
+def _saturation_vapor_pressure(temp_kelvin: float) -> float:
+    temp_celsius = temp_kelvin - 273.15
+    return 6.112 * math.exp(
+        17.67 * temp_celsius / (temp_celsius + 243.5)
+    )
+
+
+def _mixing_ratio_from_vapor_pressure(
+    vapor_pressure: float,
+    pressure: float,
+) -> float:
+    vapor_pressure = min(max(vapor_pressure, 0.0), pressure * 0.99)
+    return 0.622 * vapor_pressure / (pressure - vapor_pressure)
+
+
+def _moist_adiabatic_lapse_rate(temp_kelvin: float, pressure_hpa: float) -> float:
+    gas_constant_dry_air = 287.05
+    heat_capacity = 1004.0
+    latent_heat = 2.5e6
+    epsilon = 0.622
+    vapor_pressure = min(
+        _saturation_vapor_pressure(temp_kelvin),
+        pressure_hpa * 0.99,
+    )
+    saturation_mixing_ratio = _mixing_ratio_from_vapor_pressure(
+        vapor_pressure,
+        pressure_hpa,
+    )
+    numerator = 9.80665 / heat_capacity * (
+        1.0
+        + latent_heat * saturation_mixing_ratio
+        / (gas_constant_dry_air * temp_kelvin)
+    )
+    denominator = 1.0 + (
+        latent_heat**2
+        * saturation_mixing_ratio
+        * epsilon
+        / (heat_capacity * gas_constant_dry_air * temp_kelvin**2)
+    )
+    return numerator / denominator
+
+
+def _low_level_buoyancy_metrics(
+    hourly: dict[str, Any],
+    index: int,
+) -> dict[str, float] | None:
+    temperature_c = _hourly_number(hourly, index, "temperature_2m")
+    dewpoint_c = _hourly_number(hourly, index, "dew_point_2m")
+    surface_pressure = _hourly_number(hourly, index, "surface_pressure")
+    surface_elevation = _finite_float(hourly.get("surface_elevation_m"))
+    if (
+        temperature_c is None
+        or dewpoint_c is None
+        or surface_pressure is None
+        or surface_pressure <= 0.0
+        or surface_elevation is None
+    ):
+        return None
+
+    surface_temperature = temperature_c + 273.15
+    surface_dewpoint = min(dewpoint_c + 273.15, surface_temperature)
+    surface_mixing_ratio = _mixing_ratio_from_vapor_pressure(
+        _saturation_vapor_pressure(surface_dewpoint),
+        surface_pressure,
+    )
+    profile = [
+        (2.0, surface_pressure, surface_temperature, surface_mixing_ratio)
+    ]
+    for level in (925, 850, 700, 500):
+        pressure = float(level)
+        if pressure >= surface_pressure:
+            continue
+        temperature_c = _hourly_number(hourly, index, f"temperature_{level}hPa")
+        relative_humidity = _hourly_number(
+            hourly,
+            index,
+            f"relative_humidity_{level}hPa",
+        )
+        geopotential_height = _hourly_number(
+            hourly,
+            index,
+            f"geopotential_height_{level}hPa",
+        )
+        if (
+            temperature_c is None
+            or relative_humidity is None
+            or geopotential_height is None
+        ):
+            return None
+        height = geopotential_height - surface_elevation
+        if height <= profile[-1][0]:
+            continue
+        temperature = temperature_c + 273.15
+        vapor_pressure = (
+            _saturation_vapor_pressure(temperature)
+            * min(max(relative_humidity, 0.0), 100.0)
+            / 100.0
+        )
+        mixing_ratio = _mixing_ratio_from_vapor_pressure(vapor_pressure, pressure)
+        profile.append((height, pressure, temperature, mixing_ratio))
+
+    if profile[-1][0] < 3000.0:
+        return None
+
+    heights = np.asarray([point[0] for point in profile], dtype=float)
+    pressures = np.asarray([point[1] for point in profile], dtype=float)
+    temperatures = np.asarray([point[2] for point in profile], dtype=float)
+    mixing_ratios = np.asarray([point[3] for point in profile], dtype=float)
+    log_pressures = np.log(pressures)
+
+    lcl_temperature = 1.0 / (
+        1.0 / (surface_dewpoint - 56.0)
+        + math.log(surface_temperature / surface_dewpoint) / 800.0
+    ) + 56.0
+    lcl_pressure = surface_pressure * (
+        lcl_temperature / surface_temperature
+    ) ** (1004.0 / 287.05)
+    lcl_height = float(
+        np.interp(
+            math.log(lcl_pressure),
+            log_pressures[::-1],
+            heights[::-1],
+        )
+    )
+    lcl_height = min(max(lcl_height, 0.0), float(heights[-1]))
+
+    def pressure_at(height: float) -> float:
+        return math.exp(float(np.interp(height, heights, log_pressures)))
+
+    def moist_derivative(height: float, temperature: float) -> float:
+        return -_moist_adiabatic_lapse_rate(temperature, pressure_at(height))
+
+    def integrate_moist_parcel(
+        start_height: float,
+        start_temperature: float,
+        end_height: float,
+    ) -> float:
+        temperature = start_temperature
+        height = start_height
+        while height < end_height:
+            step = min(25.0, end_height - height)
+            k1 = moist_derivative(height, temperature)
+            k2 = moist_derivative(
+                height + step / 2.0,
+                temperature + step * k1 / 2.0,
+            )
+            k3 = moist_derivative(
+                height + step / 2.0,
+                temperature + step * k2 / 2.0,
+            )
+            k4 = moist_derivative(
+                height + step,
+                temperature + step * k3,
+            )
+            temperature += step * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+            height += step
+        return temperature
+
+    top = float(heights[-1])
+    parcel_heights = np.unique(
+        np.concatenate(
+            (
+                np.arange(0.0, top, 25.0),
+                np.asarray([0.0, 3000.0, lcl_height, top]),
+            )
+        )
+    )
+    parcel_temperatures = []
+    previous_height = 0.0
+    previous_temperature = surface_temperature
+    for height in parcel_heights:
+        pressure = pressure_at(float(height))
+        if height <= lcl_height:
+            parcel_temperature = surface_temperature * (
+                pressure / surface_pressure
+            ) ** (287.05 / 1004.0)
+        else:
+            if previous_height <= lcl_height:
+                previous_height = lcl_height
+                previous_temperature = surface_temperature * (
+                    lcl_pressure / surface_pressure
+                ) ** (287.05 / 1004.0)
+            parcel_temperature = integrate_moist_parcel(
+                previous_height,
+                previous_temperature,
+                float(height),
+            )
+        parcel_temperatures.append(parcel_temperature)
+        previous_height = float(height)
+        previous_temperature = parcel_temperature
+
+    environment_temperatures = np.interp(parcel_heights, heights, temperatures)
+    environment_mixing_ratios = np.interp(
+        parcel_heights,
+        heights,
+        mixing_ratios,
+    )
+    buoyancy = []
+    for height, parcel_temperature, environment_temperature, environment_ratio in zip(
+        parcel_heights,
+        parcel_temperatures,
+        environment_temperatures,
+        environment_mixing_ratios,
+    ):
+        pressure = pressure_at(float(height))
+        if height <= lcl_height:
+            parcel_ratio = surface_mixing_ratio
+        else:
+            parcel_ratio = _mixing_ratio_from_vapor_pressure(
+                _saturation_vapor_pressure(parcel_temperature),
+                pressure,
+            )
+        parcel_virtual_temperature = parcel_temperature * (
+            1.0 + 0.61 * parcel_ratio
+        )
+        environment_virtual_temperature = environment_temperature * (
+            1.0 + 0.61 * environment_ratio
+        )
+        buoyancy.append(
+            9.80665
+            * (parcel_virtual_temperature - environment_virtual_temperature)
+            / environment_virtual_temperature
+        )
+
+    buoyancy = np.asarray(buoyancy, dtype=float)
+    low_level_mask = parcel_heights <= 3000.0
+    low_level_heights = parcel_heights[low_level_mask]
+    low_level_buoyancy = np.maximum(buoyancy[low_level_mask], 0.0)
+    cape_0_3km = float(
+        np.sum(
+            (low_level_buoyancy[:-1] + low_level_buoyancy[1:])
+            * np.diff(low_level_heights)
+            / 2.0
+        )
+    )
+
+    lfc = NO_LFC_SENTINEL_M
+    lcl_index = int(np.searchsorted(parcel_heights, lcl_height))
+    if buoyancy[lcl_index] >= 0.0:
+        lfc = lcl_height
+    else:
+        for point in range(lcl_index, len(parcel_heights) - 1):
+            if buoyancy[point] <= 0.0 < buoyancy[point + 1]:
+                fraction = -buoyancy[point] / (
+                    buoyancy[point + 1] - buoyancy[point]
+                )
+                lfc = float(
+                    parcel_heights[point]
+                    + fraction
+                    * (parcel_heights[point + 1] - parcel_heights[point])
+                )
+                break
+
+    return {"cape_0_3km": cape_0_3km, "lfc": lfc}
+
+
+def _derive_outlook_profile_metrics(
+    hourly: dict[str, Any],
+    index: int,
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
+        field: None for field in OUTLOOK_PROFILE_FIELDS
+    }
+    wind_metrics = _wind_profile_metrics(hourly, index)
+    if wind_metrics is not None:
+        metrics.update(wind_metrics)
+    metrics["low_level_lapse"] = _low_level_lapse_rate(hourly, index)
+    buoyancy_metrics = _low_level_buoyancy_metrics(hourly, index)
+    if buoyancy_metrics is not None:
+        metrics.update(buoyancy_metrics)
+    return metrics
+
+
 
 def _outlook_axis_points(start: float, end: float) -> list[float]:
     values = [
@@ -210,7 +686,9 @@ def _valid_outlook_grid(grid: Any) -> bool:
             return False
         if not isinstance(hourly.get("cin"), list) or len(hourly["cin"]) != len(times):
             return False
-        for field in OUTLOOK_HOURLY_FIELDS:
+        if _finite_float(hourly.get("surface_elevation_m")) is None:
+            return False
+        for field in (*OUTLOOK_HOURLY_FIELDS, *OUTLOOK_PROFILE_FIELDS):
             values = hourly.get(field)
             if not isinstance(values, list) or len(values) != len(times):
                 return False
@@ -302,6 +780,10 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
             hourly = point.get("hourly")
             if not isinstance(hourly, dict):
                 raise PublisherError("Open-Meteo outlook point has no hourly data.")
+            elevation = _finite_float(point.get("elevation"))
+            if elevation is None:
+                raise PublisherError("Open-Meteo outlook point has no valid elevation.")
+            hourly["surface_elevation_m"] = elevation
             times = hourly.get("time")
             if not isinstance(times, list) or not times:
                 raise PublisherError("Open-Meteo outlook point has no timestamps.")
@@ -323,6 +805,8 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
             dewpoint_values = hourly["dew_point_2m"]
             temperature_850_values = hourly["temperature_850hPa"]
             hourly["cin"] = []
+            for field in OUTLOOK_PROFILE_FIELDS:
+                hourly[field] = []
             for index in range(len(times)):
                 cape = cape_values[index]
                 cape_values[index] = max(float(cape or 0), 0)
@@ -334,6 +818,9 @@ def _fetch_daily_outlook_grid() -> list[dict[str, Any]]:
                     if temp is not None and dewpoint is not None and temp850 is not None:
                         cin = -(float(temp) - float(dewpoint)) * 5 + (float(temp) - float(temp850)) * 3
                 hourly["cin"].append(-abs(float(cin)) if cin is not None else 0.0)
+                profile_metrics = _derive_outlook_profile_metrics(hourly, index)
+                for field in OUTLOOK_PROFILE_FIELDS:
+                    hourly[field].append(profile_metrics[field])
             grid.append({"icon_d2": hourly})
 
     if not _valid_outlook_grid(grid):
