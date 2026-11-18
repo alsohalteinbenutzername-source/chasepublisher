@@ -20,7 +20,7 @@ jobs:
       - name: Check out StormChase source modules
         uses: actions/checkout@v4
         with:
-          repository: alsohalteinbenutzername-source/stormchase
+          repository: ${{ vars.STORMCHASE_SOURCE_REPOSITORY || 'alsohalteinbenutzername-source/stormchase' }}
           ref: main
           path: stormchase-source
           token: ${{ secrets.STORMCHASE_SOURCE_TOKEN || github.token }}
